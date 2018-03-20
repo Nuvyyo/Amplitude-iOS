@@ -99,6 +99,10 @@
  */
 @property (nonatomic, assign) BOOL trackingSessionEvents;
 
+/**
+ Always attach the meta event properties to any event.
+  */
+@property (nonatomic, strong) NSDictionary *metaEventProperties;
 
 #pragma mark - Methods
 

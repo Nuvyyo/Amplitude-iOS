@@ -593,8 +593,14 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         timestamp = [NSNumber numberWithLongLong:[[self currentTime] timeIntervalSince1970] * 1000];
     }
 
+    NSMutableDictionary *mutableEventProperties = [NSMutableDictionary new];
+    [mutableEventProperties addEntriesFromDictionary:eventProperties];
+    if (self.metaEventProperties != nil) {
+        [mutableEventProperties addEntriesFromDictionary:self.metaEventProperties];
+    }
+
     // Create snapshot of all event json objects, to prevent deallocation crash
-    eventProperties = [eventProperties copy];
+    eventProperties = [mutableEventProperties copy];
     apiProperties = [apiProperties mutableCopy];
     userProperties = [userProperties copy];
     groups = [groups copy];
