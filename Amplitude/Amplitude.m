@@ -37,6 +37,7 @@
 #import "AMPUtils.h"
 #import "AMPIdentify.h"
 #import "AMPRevenue.h"
+#import "AMPTrackingOptions.h"
 #import <math.h>
 #import <sys/socket.h>
 #import <sys/sysctl.h>
@@ -88,11 +89,16 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
     AMPDeviceInfo *_deviceInfo;
     BOOL _useAdvertisingIdForDeviceId;
+    BOOL _disableIdfaTracking;
+    long long _lastEventTime;
 
     CLLocation *_lastKnownLocation;
     BOOL _locationListeningEnabled;
     CLLocationManager *_locationManager;
     AMPLocationManagerDelegate *_locationManagerDelegate;
+
+    AMPTrackingOptions *_trackingOptions;
+    NSDictionary *_apiPropertiesTrackingOptions;
 
     BOOL _inForeground;
     BOOL _offline;
@@ -224,8 +230,11 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         _updateScheduled = NO;
         _updatingCurrently = NO;
         _useAdvertisingIdForDeviceId = NO;
+        _disableIdfaTracking = NO;
         _backoffUpload = NO;
         _offline = NO;
+        _trackingOptions = SAFE_ARC_RETAIN([AMPTrackingOptions options]);
+        _apiPropertiesTrackingOptions = SAFE_ARC_RETAIN([NSDictionary dictionary]);
         _instanceName = SAFE_ARC_RETAIN(instanceName);
         _dbHelper = SAFE_ARC_RETAIN([AMPDatabaseHelper getDatabaseHelper:instanceName]);
 
@@ -246,25 +255,23 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         _backgroundQueue.name = BACKGROUND_QUEUE_NAME;
         
         [_initializerQueue addOperationWithBlock:^{
-            
-            _deviceInfo = [[AMPDeviceInfo alloc] init];
 
-            _uploadTaskID = UIBackgroundTaskInvalid;
+            self->_uploadTaskID = UIBackgroundTaskInvalid;
             
             NSString *eventsDataDirectory = [AMPUtils platformDataDirectory];
             NSString *propertyListPath = [eventsDataDirectory stringByAppendingPathComponent:@"com.amplitude.plist"];
-            if (![_instanceName isEqualToString:kAMPDefaultInstance]) {
-                propertyListPath = [NSString stringWithFormat:@"%@_%@", propertyListPath, _instanceName]; // namespace pList with instance name
+            if (![self->_instanceName isEqualToString:kAMPDefaultInstance]) {
+                propertyListPath = [NSString stringWithFormat:@"%@_%@", propertyListPath, self->_instanceName]; // namespace pList with instance name
             }
-            _propertyListPath = SAFE_ARC_RETAIN(propertyListPath);
-            _eventsDataPath = SAFE_ARC_RETAIN([eventsDataDirectory stringByAppendingPathComponent:@"com.amplitude.archiveDict"]);
+            self->_propertyListPath = SAFE_ARC_RETAIN(propertyListPath);
+            self->_eventsDataPath = SAFE_ARC_RETAIN([eventsDataDirectory stringByAppendingPathComponent:@"com.amplitude.archiveDict"]);
             [self upgradePrefs];
 
             // Load propertyList object
-            _propertyList = SAFE_ARC_RETAIN([self deserializePList:_propertyListPath]);
-            if (!_propertyList) {
-                _propertyList = SAFE_ARC_RETAIN([NSMutableDictionary dictionary]);
-                [_propertyList setObject:[NSNumber numberWithInt:1] forKey:DATABASE_VERSION];
+            self->_propertyList = SAFE_ARC_RETAIN([self deserializePList:self->_propertyListPath]);
+            if (!self->_propertyList) {
+                self->_propertyList = SAFE_ARC_RETAIN([NSMutableDictionary dictionary]);
+                [self->_propertyList setObject:[NSNumber numberWithInt:1] forKey:DATABASE_VERSION];
                 BOOL success = [self savePropertyList];
                 if (!success) {
                     AMPLITUDE_ERROR(@"ERROR: Unable to save propertyList to file on initialization");
@@ -275,7 +282,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
             // update database if necessary
             int oldDBVersion = 1;
-            NSNumber *oldDBVersionSaved = [_propertyList objectForKey:DATABASE_VERSION];
+            NSNumber *oldDBVersionSaved = [self->_propertyList objectForKey:DATABASE_VERSION];
             if (oldDBVersionSaved != nil) {
                 oldDBVersion = [oldDBVersionSaved intValue];
             }
@@ -283,40 +290,40 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
             // update the database
             if (oldDBVersion < kAMPDBVersion) {
                 if ([self.dbHelper upgrade:oldDBVersion newVersion:kAMPDBVersion]) {
-                    [_propertyList setObject:[NSNumber numberWithInt:kAMPDBVersion] forKey:DATABASE_VERSION];
+                    [self->_propertyList setObject:[NSNumber numberWithInt:kAMPDBVersion] forKey:DATABASE_VERSION];
                     [self savePropertyList];
                 }
             }
 
             // only on default instance, migrate all of old _eventsData object to database store if database just created
-            if ([_instanceName isEqualToString:kAMPDefaultInstance] && oldDBVersion < kAMPDBFirstVersion) {
+            if ([self->_instanceName isEqualToString:kAMPDefaultInstance] && oldDBVersion < kAMPDBFirstVersion) {
                 if ([self migrateEventsDataToDB]) {
                     // delete events data so don't need to migrate next time
-                    if ([[NSFileManager defaultManager] fileExistsAtPath:_eventsDataPath]) {
-                        [[NSFileManager defaultManager] removeItemAtPath:_eventsDataPath error:NULL];
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:self->_eventsDataPath]) {
+                        [[NSFileManager defaultManager] removeItemAtPath:self->_eventsDataPath error:NULL];
                     }
                 }
             }
-            SAFE_ARC_RELEASE(_eventsDataPath);
+            SAFE_ARC_RELEASE(self->_eventsDataPath);
 
             // try to restore previous session
             long long previousSessionId = [self previousSessionId];
             if (previousSessionId >= 0) {
-                _sessionId = previousSessionId;
+                self->_sessionId = previousSessionId;
             }
+            self->_lastEventTime = [self getLastEventTime];
+            self->_optOut = [self loadOptOut];
 
-            [self initializeDeviceId];
-
-            [_backgroundQueue setSuspended:NO];
+            [self->_backgroundQueue setSuspended:NO];
         }];
 
         // CLLocationManager must be created on the main thread
         dispatch_async(dispatch_get_main_queue(), ^{
             Class CLLocationManager = NSClassFromString(@"CLLocationManager");
-            _locationManager = [[CLLocationManager alloc] init];
-            _locationManagerDelegate = [[AMPLocationManagerDelegate alloc] init];
+            self->_locationManager = [[CLLocationManager alloc] init];
+            self->_locationManagerDelegate = [[AMPLocationManagerDelegate alloc] init];
             SEL setDelegate = NSSelectorFromString(@"setDelegate:");
-            [_locationManager performSelector:setDelegate withObject:_locationManagerDelegate];
+            [self->_locationManager performSelector:setDelegate withObject:self->_locationManagerDelegate];
         });
 
         [self addObservers];
@@ -421,6 +428,8 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     SAFE_ARC_RELEASE(_propertyListPath);
     SAFE_ARC_RELEASE(_dbHelper);
     SAFE_ARC_RELEASE(_instanceName);
+    SAFE_ARC_RELEASE(_trackingOptions);
+    SAFE_ARC_RELEASE(_apiPropertiesTrackingOptions);
 
 
     SAFE_ARC_SUPER_DEALLOC();
@@ -468,11 +477,25 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         _apiKey = apiKey;
 
         [self runOnBackgroundQueue:^{
+            self->_deviceInfo = [[AMPDeviceInfo alloc] init:self->_disableIdfaTracking];
+            [self initializeDeviceId];
             if (setUserId) {
                 [self setUserId:userId];
             } else {
-                _userId = SAFE_ARC_RETAIN([self.dbHelper getValue:USER_ID]);
+                self->_userId = SAFE_ARC_RETAIN([self.dbHelper getValue:USER_ID]);
             }
+
+            __unsafe_unretained typeof(self) weakSelf = self;
+            [self->_dbHelper setDatabaseResetListener:^{
+                __strong typeof(self) strongSelf = weakSelf;
+                if (strongSelf) {
+                    [strongSelf->_dbHelper insertOrReplaceKeyValue:DEVICE_ID value:strongSelf->_deviceId];
+                    [strongSelf->_dbHelper insertOrReplaceKeyValue:USER_ID value:strongSelf->_userId];
+                    [strongSelf->_dbHelper insertOrReplaceKeyLongValue:OPT_OUT value:[NSNumber numberWithBool:strongSelf->_optOut]];
+                    [strongSelf->_dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_ID value:[NSNumber numberWithLongLong:strongSelf->_sessionId]];
+                    [strongSelf->_dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_TIME value:[NSNumber numberWithLongLong:strongSelf->_lastEventTime]];
+                }
+            }];
         }];
 
         // Normally _inForeground is set by the enterForeground callback, but initializeWithApiKey will be called after the app's enterForeground
@@ -484,9 +507,9 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
                 UIApplicationState state = app.applicationState;
                 if (state != UIApplicationStateBackground) {
                     [self runOnBackgroundQueue:^{
-                        NSNumber* now = [NSNumber numberWithLongLong:[[self currentTime] timeIntervalSince1970] * 1000];
+                        long long now = [[self currentTime] timeIntervalSince1970] * 1000;
                         [self startOrContinueSession:now];
-                        _inForeground = YES;
+                        self->_inForeground = YES;
                     }];
 
                 }
@@ -601,7 +624,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     
     [self runOnBackgroundQueue:^{
         // Respect the opt-out setting by not sending or storing any events.
-        if ([self optOut])  {
+        if (self->_optOut)  {
             AMPLITUDE_LOG(@"User has opted out of tracking. Event %@ not logged.", eventType);
             SAFE_ARC_RELEASE(eventProperties);
             SAFE_ARC_RELEASE(apiProperties);
@@ -611,9 +634,9 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         }
 
         // skip session check if logging start_session or end_session events
-        BOOL loggingSessionEvent = _trackingSessionEvents && ([eventType isEqualToString:kAMPSessionStartEvent] || [eventType isEqualToString:kAMPSessionEndEvent]);
+        BOOL loggingSessionEvent = self->_trackingSessionEvents && ([eventType isEqualToString:kAMPSessionStartEvent] || [eventType isEqualToString:kAMPSessionEndEvent]);
         if (!loggingSessionEvent && !outOfSession) {
-            [self startOrContinueSession:timestamp];
+            [self startOrContinueSession:[timestamp longLongValue]];
         }
 
         NSMutableDictionary *event = [NSMutableDictionary dictionary];
@@ -622,7 +645,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         [event setValue:[self replaceWithEmptyJSON:apiProperties] forKey:@"api_properties"];
         [event setValue:[self truncate:[AMPUtils makeJSONSerializable:[self replaceWithEmptyJSON:userProperties]]] forKey:@"user_properties"];
         [event setValue:[self truncate:[AMPUtils validateGroups:[self replaceWithEmptyJSON:groups]]] forKey:@"groups"];
-        [event setValue:[NSNumber numberWithLongLong:outOfSession ? -1 : _sessionId] forKey:@"session_id"];
+        [event setValue:[NSNumber numberWithLongLong:outOfSession ? -1 : self->_sessionId] forKey:@"session_id"];
         [event setValue:timestamp forKey:@"timestamp"];
 
         SAFE_ARC_RELEASE(eventProperties);
@@ -684,15 +707,33 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 {
     [event setValue:_userId forKey:@"user_id"];
     [event setValue:_deviceId forKey:@"device_id"];
-    [event setValue:kAMPPlatform forKey:@"platform"];
-    [event setValue:_deviceInfo.appVersion forKey:@"version_name"];
-    [event setValue:_deviceInfo.osName forKey:@"os_name"];
-    [event setValue:_deviceInfo.osVersion forKey:@"os_version"];
-    [event setValue:_deviceInfo.model forKey:@"device_model"];
-    [event setValue:_deviceInfo.manufacturer forKey:@"device_manufacturer"];
-    [event setValue:_deviceInfo.carrier forKey:@"carrier"];
-    [event setValue:_deviceInfo.country forKey:@"country"];
-    [event setValue:_deviceInfo.language forKey:@"language"];
+    if ([self->_trackingOptions shouldTrackPlatform]) {
+        [event setValue:kAMPPlatform forKey:@"platform"];
+    }
+    if ([self->_trackingOptions shouldTrackVersionName]) {
+        [event setValue:_deviceInfo.appVersion forKey:@"version_name"];
+    }
+    if ([self->_trackingOptions shouldTrackOSName]) {
+        [event setValue:_deviceInfo.osName forKey:@"os_name"];
+    }
+    if ([self->_trackingOptions shouldTrackOSVersion]) {
+        [event setValue:_deviceInfo.osVersion forKey:@"os_version"];
+    }
+    if ([self->_trackingOptions shouldTrackDeviceModel]) {
+        [event setValue:_deviceInfo.model forKey:@"device_model"];
+    }
+    if ([self->_trackingOptions shouldTrackDeviceManufacturer]) {
+        [event setValue:_deviceInfo.manufacturer forKey:@"device_manufacturer"];
+    }
+    if ([self->_trackingOptions shouldTrackCarrier]) {
+        [event setValue:_deviceInfo.carrier forKey:@"carrier"];
+    }
+    if ([self->_trackingOptions shouldTrackCountry]) {
+        [event setValue:_deviceInfo.country forKey:@"country"];
+    }
+    if ([self->_trackingOptions shouldTrackLanguage]) {
+        [event setValue:_deviceInfo.language forKey:@"language"];
+    }
     NSDictionary *library = @{
         @"name": kAMPLibrary,
         @"version": kAMPVersion
@@ -704,15 +745,15 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     NSMutableDictionary *apiProperties = [event valueForKey:@"api_properties"];
 
     NSString* advertiserID = _deviceInfo.advertiserID;
-    if (advertiserID) {
+    if ([self->_trackingOptions shouldTrackIDFA] && advertiserID) {
         [apiProperties setValue:advertiserID forKey:@"ios_idfa"];
     }
     NSString* vendorID = _deviceInfo.vendorID;
-    if (vendorID) {
+    if ([self->_trackingOptions shouldTrackIDFV] && vendorID) {
         [apiProperties setValue:vendorID forKey:@"ios_idfv"];
     }
     
-    if (_lastKnownLocation != nil) {
+    if ([self->_trackingOptions shouldTrackLatLng] && _lastKnownLocation != nil) {
         @synchronized (_locationManager) {
             NSMutableDictionary *location = [NSMutableDictionary dictionary];
 
@@ -731,6 +772,10 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
             [apiProperties setValue:location forKey:@"location"];
         }
+    }
+
+    if (self->_apiPropertiesTrackingOptions.count > 0) {
+        [apiProperties setValue:self->_apiPropertiesTrackingOptions forKey:@"tracking_options"];
     }
 }
 
@@ -832,15 +877,15 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     [self runOnBackgroundQueue:^{
 
         // Don't communicate with the server if the user has opted out.
-        if ([self optOut] || _offline)  {
-            _updatingCurrently = NO;
+        if (self->_optOut || self->_offline)  {
+            self->_updatingCurrently = NO;
             return;
         }
 
         long eventCount = [self.dbHelper getTotalEventCount];
         long numEvents = limit > 0 ? fminl(eventCount, limit) : eventCount;
         if (numEvents == 0) {
-            _updatingCurrently = NO;
+            self->_updatingCurrently = NO;
             return;
         }
         NSMutableArray *events = [self.dbHelper getEvents:-1 limit:numEvents];
@@ -856,7 +901,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         eventsDataLocal = [NSJSONSerialization dataWithJSONObject:uploadEvents options:0 error:&error];
         if (error != nil) {
             AMPLITUDE_ERROR(@"ERROR: NSJSONSerialization error: %@", error);
-            _updatingCurrently = NO;
+            self->_updatingCurrently = NO;
             return;
         }
 
@@ -866,7 +911,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
             if (eventsString != nil) {
                 SAFE_ARC_RELEASE(eventsString);
             }
-            _updatingCurrently = NO;
+            self->_updatingCurrently = NO;
             return;
         }
 
@@ -1028,12 +1073,12 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
                 }
 
                 // server complained about length of request, backoff and try again
-                _backoffUpload = YES;
-                long newNumEvents = MIN(numEvents, _backoffUploadBatchSize);
-                _backoffUploadBatchSize = MAX((int)ceilf(newNumEvents / 2.0f), 1);
+                self->_backoffUpload = YES;
+                long newNumEvents = MIN(numEvents, self->_backoffUploadBatchSize);
+                self->_backoffUploadBatchSize = MAX((int)ceilf(newNumEvents / 2.0f), 1);
                 AMPLITUDE_LOG(@"Request too large, will decrease size and attempt to reupload");
-                _updatingCurrently = NO;
-                [self uploadEventsWithLimit:_backoffUploadBatchSize];
+                self->_updatingCurrently = NO;
+                [self uploadEventsWithLimit:self->_backoffUploadBatchSize];
 
             } else {
                 AMPLITUDE_ERROR(@"ERROR: Connection response received:%ld, %@", (long)[httpResponse statusCode],
@@ -1053,23 +1098,23 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
             AMPLITUDE_ERROR(@"ERROR: response empty, error empty for NSURLConnection");
         }
 
-        _updatingCurrently = NO;
+        self->_updatingCurrently = NO;
 
         if (uploadSuccessful && [self.dbHelper getEventCount] > self.eventUploadThreshold) {
-            int limit = _backoffUpload ? _backoffUploadBatchSize : 0;
+            int limit = self->_backoffUpload ? self->_backoffUploadBatchSize : 0;
             [self uploadEventsWithLimit:limit];
 
-        } else if (_uploadTaskID != UIBackgroundTaskInvalid) {
+        } else if (self->_uploadTaskID != UIBackgroundTaskInvalid) {
             if (uploadSuccessful) {
-                _backoffUpload = NO;
-                _backoffUploadBatchSize = self.eventUploadMaxBatchSize;
+                self->_backoffUpload = NO;
+                self->_backoffUploadBatchSize = self.eventUploadMaxBatchSize;
             }
 
             // Upload finished, allow background task to be ended
             UIApplication *app = [self getSharedApplication];
             if (app != nil) {
-                [app endBackgroundTask:_uploadTaskID];
-                _uploadTaskID = UIBackgroundTaskInvalid;
+                [app endBackgroundTask:self->_uploadTaskID];
+                self->_uploadTaskID = UIBackgroundTaskInvalid;
             }
         }
     }] resume];
@@ -1086,7 +1131,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
     [self updateLocation];
 
-    NSNumber* now = [NSNumber numberWithLongLong:[[self currentTime] timeIntervalSince1970] * 1000];
+    long long now = [[self currentTime] timeIntervalSince1970] * 1000;
 
     // Stop uploading
     if (_uploadTaskID != UIBackgroundTaskInvalid) {
@@ -1095,7 +1140,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     }
     [self runOnBackgroundQueue:^{
         [self startOrContinueSession:now];
-        _inForeground = YES;
+        self->_inForeground = YES;
         [self uploadEvents];
     }];
 }
@@ -1107,7 +1152,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
         return;
     }
 
-    NSNumber* now = [NSNumber numberWithLongLong:[[self currentTime] timeIntervalSince1970] * 1000];
+    long long now = [[self currentTime] timeIntervalSince1970] * 1000;
 
     // Stop uploading
     if (_uploadTaskID != UIBackgroundTaskInvalid) {
@@ -1115,15 +1160,22 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     }
     _uploadTaskID = [app beginBackgroundTaskWithExpirationHandler:^{
         //Took too long, manually stop
-        if (_uploadTaskID != UIBackgroundTaskInvalid) {
-            [app endBackgroundTask:_uploadTaskID];
-            _uploadTaskID = UIBackgroundTaskInvalid;
+        if (self->_uploadTaskID != UIBackgroundTaskInvalid) {
+            [app endBackgroundTask:self->_uploadTaskID];
+            self->_uploadTaskID = UIBackgroundTaskInvalid;
         }
     }];
     [self runOnBackgroundQueue:^{
-        _inForeground = NO;
+        self->_inForeground = NO;
         [self refreshSessionTime:now];
         [self uploadEventsWithLimit:0];
+
+        // persist metadata back into database
+        [self->_dbHelper insertOrReplaceKeyValue:DEVICE_ID value:self->_deviceId];
+        [self->_dbHelper insertOrReplaceKeyValue:USER_ID value:self->_userId];
+        [self->_dbHelper insertOrReplaceKeyLongValue:OPT_OUT value:[NSNumber numberWithBool:self->_optOut]];
+        [self->_dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_ID value:[NSNumber numberWithLongLong:self->_sessionId]];
+        [self->_dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_TIME value:[NSNumber numberWithLongLong:self->_lastEventTime]];
     }];
 }
 
@@ -1136,7 +1188,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
  *
  * Returns YES if a new session was created.
  */
-- (BOOL)startOrContinueSession:(NSNumber*) timestamp
+- (BOOL)startOrContinueSession:(long long) timestamp
 {
     if (!_inForeground) {
         if ([self inSession]) {
@@ -1169,12 +1221,12 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     return NO;
 }
 
-- (void)startNewSession:(NSNumber*) timestamp
+- (void)startNewSession:(long long) timestamp
 {
     if (_trackingSessionEvents) {
         [self sendSessionEvent:kAMPSessionEndEvent];
     }
-    [self setSessionId:[timestamp longLongValue]];
+    [self setSessionId:timestamp];
     [self refreshSessionTime:timestamp];
     if (_trackingSessionEvents) {
         [self sendSessionEvent:kAMPSessionStartEvent];
@@ -1194,7 +1246,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
     NSMutableDictionary *apiProperties = [NSMutableDictionary dictionary];
     [apiProperties setValue:sessionEvent forKey:@"special"];
-    NSNumber* timestamp = [self lastEventTime];
+    NSNumber *timestamp = [NSNumber numberWithLongLong:self->_lastEventTime];
     [self logEvent:sessionEvent withEventProperties:nil withApiProperties:apiProperties withUserProperties:nil withGroups:nil withTimestamp:timestamp outOfSession:NO];
 }
 
@@ -1203,12 +1255,9 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     return _sessionId >= 0;
 }
 
-- (BOOL)isWithinMinTimeBetweenSessions:(NSNumber*) timestamp
+- (BOOL)isWithinMinTimeBetweenSessions:(long long) timestamp
 {
-    NSNumber *previousSessionTime = [self lastEventTime];
-    long long timeDelta = [timestamp longLongValue] - [previousSessionTime longLongValue];
-
-    return timeDelta < self.minTimeBetweenSessionsMillis;
+    return (timestamp - self->_lastEventTime) < self.minTimeBetweenSessionsMillis;
 }
 
 /**
@@ -1216,14 +1265,14 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
  */
 - (void)setSessionId:(long long) timestamp
 {
-    _sessionId = timestamp;
+    self->_sessionId = timestamp;
     [self setPreviousSessionId:_sessionId];
 }
 
 /**
  * Update the session timer if there's a running session.
  */
-- (void)refreshSessionTime:(NSNumber*) timestamp
+- (void)refreshSessionTime:(long long) timestamp
 {
     if (![self inSession]) {
         return;
@@ -1246,14 +1295,20 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     return [previousSessionId longLongValue];
 }
 
-- (void)setLastEventTime:(NSNumber*) timestamp
+- (void)setLastEventTime:(long long) timestamp
 {
-    (void) [self.dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_TIME value:timestamp];
+    self->_lastEventTime = timestamp;
+    NSNumber *value = [NSNumber numberWithLongLong:timestamp];
+    (void) [self.dbHelper insertOrReplaceKeyLongValue:PREVIOUS_SESSION_TIME value:value];
 }
 
-- (NSNumber*)lastEventTime
+- (long long)getLastEventTime
 {
-    return [self.dbHelper getLongValue:PREVIOUS_SESSION_TIME];
+    NSNumber *lastEventTime = [self.dbHelper getLongValue:PREVIOUS_SESSION_TIME];
+    if (lastEventTime == nil) {
+        return -1;
+    }
+    return [lastEventTime longLongValue];
 }
 
 - (void)startSession
@@ -1330,23 +1385,55 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
 }
 
+- (void)setTrackingOptions:(AMPTrackingOptions *) options
+{
+    if (![self isArgument:options validType:[AMPTrackingOptions class] methodName:@"setTrackingOptions:"]) {
+        return;
+    }
+
+    (void) SAFE_ARC_RETAIN(options);
+    SAFE_ARC_RELEASE(self->_trackingOptions);
+    SAFE_ARC_RELEASE(self->_apiPropertiesTrackingOptions);
+    self->_trackingOptions = options;
+    self->_apiPropertiesTrackingOptions = SAFE_ARC_RETAIN([NSDictionary dictionaryWithDictionary:[options getApiPropertiesTrackingOption]]);
+}
+
 - (void)setUserId:(NSString*) userId
+{
+    [self setUserId:userId startNewSession:NO];
+}
+
+- (void)setUserId:(NSString*) userId startNewSession:(BOOL) startNewSession
 {
     if (!(userId == nil || [self isArgument:userId validType:[NSString class] methodName:@"setUserId:"])) {
         return;
     }
-    
+
     [self runOnBackgroundQueue:^{
+        if (startNewSession && self->_trackingSessionEvents) {
+            [self sendSessionEvent:kAMPSessionEndEvent];
+        }
+
         (void) SAFE_ARC_RETAIN(userId);
-        SAFE_ARC_RELEASE(_userId);
-        _userId = userId;
-        (void) [self.dbHelper insertOrReplaceKeyValue:USER_ID value:_userId];
+        SAFE_ARC_RELEASE(self->_userId);
+        self->_userId = userId;
+        (void) [self.dbHelper insertOrReplaceKeyValue:USER_ID value:self->_userId];
+
+        if (startNewSession) {
+            long long timestamp = [[self currentTime] timeIntervalSince1970] * 1000;
+            [self setSessionId:timestamp];
+            [self refreshSessionTime:timestamp];
+            if (self->_trackingSessionEvents) {
+                [self sendSessionEvent:kAMPSessionStartEvent];
+            }
+        }
     }];
 }
 
 - (void)setOptOut:(BOOL)enabled
 {
     [self runOnBackgroundQueue:^{
+        self->_optOut = enabled;
         NSNumber *value = [NSNumber numberWithBool:enabled];
         (void) [self.dbHelper insertOrReplaceKeyLongValue:OPT_OUT value:value];
     }];
@@ -1367,9 +1454,13 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     _backoffUploadBatchSize = eventUploadMaxBatchSize;
 }
 
-- (BOOL)optOut
+- (BOOL)loadOptOut
 {
-    return [[self.dbHelper getLongValue:OPT_OUT] boolValue];
+    NSNumber *value = [self.dbHelper getLongValue:OPT_OUT];
+    if (value == nil) {
+        return NO;
+    }
+    return [value boolValue];
 }
 
 - (void)setDeviceId:(NSString*)deviceId
@@ -1380,8 +1471,8 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
     [self runOnBackgroundQueue:^{
         (void) SAFE_ARC_RETAIN(deviceId);
-        SAFE_ARC_RELEASE(_deviceId);
-        _deviceId = deviceId;
+        SAFE_ARC_RELEASE(self->_deviceId);
+        self->_deviceId = deviceId;
         (void) [self.dbHelper insertOrReplaceKeyValue:DEVICE_ID value:deviceId];
     }];
 }
@@ -1425,6 +1516,11 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
     _useAdvertisingIdForDeviceId = YES;
 }
 
+- (void)disableIdfaTracking
+{
+    _disableIdfaTracking = YES;
+}
+
 #pragma mark - Getters for device data
 - (NSString*) getDeviceId
 {
@@ -1434,6 +1530,11 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 - (long long) getSessionId
 {
     return _sessionId;
+}
+
+- (BOOL) getOptOut
+{
+    return _optOut;
 }
 
 - (NSString*) initializeDeviceId
@@ -1652,7 +1753,7 @@ static NSString *const SEQUENCE_NUMBER = @"sequence_number";
 
 - (id)unarchive:(NSString*)path {
     // unarchive using new NSKeyedUnarchiver method from iOS 9.0 that doesn't throw exceptions
-    if (floor(NSFoundationVersionNumber) > NSFoundationVersionNumber_iOS_8_4) {
+    if (@available(iOS 9.0, *)) {
         NSFileManager *fileManager = [NSFileManager defaultManager];
         if ([fileManager fileExistsAtPath:path]) {
             NSData *inputData = [fileManager contentsAtPath:path];

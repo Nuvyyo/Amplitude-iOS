@@ -1,5 +1,25 @@
 ## Unreleased
 
+## 4.3.1 (August 14, 2018)
+
+* Update SDK to better handle SQLite Exceptions.
+
+## 4.3.0 (July 24, 2018)
+
+* Add `AMPTrackingOptions` interface to customize the automatic tracking of user properties in the SDK (such as language, ip_address, platform, etc). See [Help Center Documentation](https://amplitude.zendesk.com/hc/en-us/articles/115002278527#disable-automatic-tracking-of-properties) for instructions on setting up this configuration.
+
+## 4.2.1 (May 21, 2018)
+
+* Fix a bunch of compiler warnings
+* Fix SSLPinning import so that it doesn't corrupt debug console. Thanks to @rob-keepsafe for the PR
+
+## 4.2.0 (April 19, 2018)
+
+* Added a `setUserId` method with optional boolean argument `startNewSession`, which when `YES` starts a new session after changing the userId.
+
+## 4.1.0 (February 27, 2018)
+* Add option to disable IDFA tracking. To disable IDFA tracking call `[[Amplitude instance] disableIdfaTracking];` before initializing with your API key.
+
 ## 4.0.4 (October 23, 2017)
 
 * Fix bug where events in the initial session for brand new users have a session id of -1 (introduced in v4.0.2).
